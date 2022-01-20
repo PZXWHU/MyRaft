@@ -22,13 +22,20 @@ Raft 通过选举一个高贵的领导人，然后给予他全部的管理复制
 2. 领导者周期性的向所有跟随者发送心跳包，一个服务器节点继续保持着跟随者状态只要他从领导人或者候选者处接收到有效的 RPCs
 3. 如果一个跟随者在一段时间里没有接收到任何消息，也就是**选举超时**（ election timeout），则发起选举以选出新的领导者
 
-### 进行领导选举
+### 候选者行为
 1. 跟随者先要增加自己的当前任期号并且转换到候选人状态
 2. 然后他会投票给自己，然后并行的向集群中的其他服务器节点发送请求投票的 RPCs 来给自己投票
 3. 候选人会继续保持着当前状态直到以下三件事情之一发生：
     (a) 他自己赢得了这次的选举；
     (b) 其他的服务器成为领导者；
     (c) 一段时间之后没有任何一个获胜的人
+    
+### 跟随者行为
+1. 如果当前有确认的leader，则忽略请求投票的RPC
+2. 如果当前任期大于请求投票中的任期，则拒绝为其投票
+3. 如果当前任期小于请求投票中的人去，则处理任期落后
+4. 如果已经投过票了，则拒绝为其投票
+5. 如果请求投票中的日志信息比当前节点的日志更新，则同意投票。否则拒绝投票
 
 ### 领导选举结果
 1. 当一个候选人从整个集群的大多数服务器节点获得了针对同一个任期号的选票，那么他就赢得了这次选举并成为领导人。然后他会向其他的服务器发送心跳消息来建立自己的权威并且阻止新的领导人的产生。
@@ -106,6 +113,49 @@ Raft 通过选举一个高贵的领导人，然后给予他全部的管理复制
 
 ### 安装快照
 领导人必须偶尔的发送快照给一些落后的跟随者。这通常发生在当领导人已经将下一条需要发送给跟随者的日志条目删除，储存在快照中。由领导人调用以将快照的分块发送给跟随者。领导者总是按顺序发送分块。
+
+
+## 线性一致性
+https://zhuanlan.zhihu.com/p/47117804
+https://www.zhihu.com/question/468357665/answer/1966740883
+共识算法只能保证多个节点对某个对象的状态是一致的，以 Raft 为例，它只能保证不同节点对 Raft Log（以下简称 Log）能达成一致。那么 Log 后面的状态机（state machine）的一致性呢？并没有做详细规定，用户可以自由实现。
+### raft违反线性一致性
+Client 将请求发送到 Leader 后，Leader 将请求作为一个 Proposal 通过 Raft 复制到自身以及 Follower 的 Log 中，然后将其 commit。TiKV 将 commit 的 Log 应用到 RocksDB 上，由于 Input（即 Log）都一样，可推出各个 TiKV 的状态机（即 RocksDB）的状态能达成一致。但实际多个 TiKV 不能保证同时将某一个 Log 应用到 RocksDB 上，也就是说各个节点不能实时一致，加之 Leader 会在不同节点之间切换，所以 Leader 的状态机也不总有最新的状态。Leader 处理请求时稍有不慎，没有在最新的状态上进行，这会导致整个系统违反线性一致性。
+
+### 保证raft的线性一致性
+（1）将read操作作为log
+收到请求后阻塞Client，无论是读请求还是写请求统统生成Log，等Log被Apply的时候返回给客户，Log是严格被顺序Apply的，因此必定满足线性一致性。
+
+缺点：第一，读请求的数量一般是要远大于写请求的数量的，而只读请求的Log并不会改变状态机的状态，因此我们往往希望向Log中只记录写请求；
+第二，对于写请求，我们一般不会阻塞客户到Apply之后，而是在Commit的时刻就可以返回了，因为Commit本身就意味着“只要我的集群不崩，
+那么这个请求迟早会被apply”。也正是因此，Apply操作一般放在后台与Raft算法并行，等成功Apply之后通过回调或者其他方式修改ApplyIndex；
+第三，所有的读写操作都落到了Leader上，这使得Leader成为了一个Hot Spot。
+
+（2）ReadIndex
+ReadIndex不需要生成关于读请求的Log，在这种情境下，不妨将每个Read请求想象成Log之间的缝隙。
+对于写请求，当请求成功得被commit之后就可以向客户返回成功了，而具体的apply时刻会被放在后台进行；
+- 对于leader： 对于读请求，Leader会记录下请求到来时刻的commitIndex（记为readIndex），
+并随后通过一轮check qurom确定自己在请求到来时刻自己是不是Leader，如果check qurom通过，那么被记录下的readIndex，
+就是请求到来时刻的最新的commitIndex，此时只需要等待applyIndex到达readIndex，即状态机成功apply完那个时刻所有已commit的数据，
+就可以读取状态机状态了。
+- 对于follower：读请求其实是可以放到Follower上来做的，与ReadIndex的实现原理同理，只要知道请求到达的那个时刻最新的commitIndex，
+Follower就可以等自己的applyIndex == followerReadIndex时，读取状态机的状态并返回给客户了。至于commitIndex的获取，
+最简单的方式就是直接向Leader咨询，当然Leader为了保证自己的commitIndex是最新的，同样需要一轮check qurom的RPC开销，
+但与前面不同的是，这里Leader不再负担读操作的开销，而是仅需要负担通信和同步的开销，这是一种非常有效的优化
+
+缺点：上述情景下，每个读请求都需要一轮check qurom，当然我们可以通过对读请求进行batching，以延迟换取相对少的RPC轮数。
+
+（3）LeaseRead
+LeaseRead 与 ReadIndex 类似，但更进一步，不仅省去了 Log，还省去了网络交互。它可以大幅提升读的吞吐也能显著降低延时。
+基本的思路是 Leader 取一个比 Election Timeout 小的租期，在租期不会发生选举，确保 Leader 不会变。
+
+Lease Read可以依赖时间来满足线性一致读，具体来说，它依赖了Raft选举算法的某些特性：
+如果一个Follower在election timeout内收到了Leader的心跳信息，那么Follower会拒绝投票（即使拉票者的term更高），
+或者将投票操作阻塞到超过election timeout之后再进行。这样如果一个Leader成功的做了check qurom，
+那么在一个election timeout内可以认为集群不会出现更新的Leader，这段election timeout时期被称为Lease期。
+由于Lease期内不会出现新的Leader且已经check qurom，因此此时的Leader应该是最新的Leader，它持有最高的commitIndex。
+据此，Lease期的Leader对于来自客户的读请求，可以直接使用commitIndex作为readIndex，对于来自follower的获取commitIndex的请求，
+可以直接将commitIndex返回给它。
 
 
 ## 实现细节可参考源代码
